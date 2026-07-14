@@ -182,7 +182,14 @@ async function callClaude(content) {
       messages: [{ role: "user", content }],
     }),
   });
-  const data = await response.json();
+  const raw = await response.text();
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    /* Respuestas no-JSON del servidor: "Request Entity Too Large" (413), HTML de error, etc. */
+    throw new Error(`Respuesta no válida del servidor (HTTP ${response.status}): ${raw.slice(0, 80)}`);
+  }
   if (data.error) throw new Error(data.error.message || "Error de API");
   return (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
 }
@@ -218,15 +225,13 @@ async function scanFromBase64(base64, mediaType, prompt) {
   return normalizeExtraction(parseClaudeJson(await callClaude([block, { type: "text", text: prompt }])));
 }
 
-async function scanWorkorder(file, prompt = BASE_EXTRACTION_PROMPT) {
-  return scanFromBase64(await fileToBase64(file), file.type, prompt);
-}
 
 /**
- * Comprime una imagen a JPEG (máx. 1100 px lado mayor, calidad 0,6) para
- * adjuntarla a la entrada sin exceder el límite de 5MB/clave del almacenamiento.
+ * Comprime una imagen a JPEG (máx. 1600 px lado mayor, calidad 0,8):
+ * suficiente resolución para OCR de texto de OT y muy por debajo del
+ * límite del endpoint (~4,5MB) y del almacenamiento (5MB/clave).
  */
-async function compressImage(file, maxDim = 1100, quality = 0.6) {
+async function compressImage(file, maxDim = 1600, quality = 0.8) {
   return new Promise((res, rej) => {
     const img = new Image();
     const url = URL.createObjectURL(file);
@@ -475,13 +480,20 @@ export default function LmaOcrExtractor() {
     const prompt = buildExtractionPrompt(learning); // inyecta reglas + correcciones acumuladas
     for (const file of list) {
       try {
-        const extracted = await scanWorkorder(file, prompt);
-        const flat = { ...extracted, seq: seqToString(extracted.seq) };
-        /* Conservar la imagen comprimida para adjuntarla al confirmar (los PDF no se adjuntan) */
+        /* Comprimir SIEMPRE la imagen antes del OCR: las fotos de cámara móvil
+           (3–8MB) superan el límite del endpoint y provocan errores 413 no-JSON.
+           La misma imagen comprimida sirve de adjunto (una sola compresión). */
+        let extracted;
         let photoData = null;
-        if (file.type !== "application/pdf") {
-          try { photoData = await compressImage(file); } catch (e) { /* sin adjunto */ }
+        if (file.type === "application/pdf") {
+          const base64 = await fileToBase64(file);
+          if (base64.length > 4.2 * 1024 * 1024) throw new Error("PDF demasiado grande (>4MB): fotografía la página en su lugar");
+          extracted = await scanFromBase64(base64, "application/pdf", prompt);
+        } else {
+          photoData = await compressImage(file);
+          extracted = await scanFromBase64(photoData.split(",")[1], "image/jpeg", prompt);
         }
+        const flat = { ...extracted, seq: seqToString(extracted.seq) };
         setPending((p) => [
           ...p,
           { ...flat, id: uuid(), fileName: file.name, ocrOriginal: { ...flat }, photoData },
@@ -1250,7 +1262,7 @@ RESPONDE SOLO CON JSON: {"rules": ["regla 1", "regla 2"]}`,
                 📥 Procesar cola offline ({cola.length})
               </button>
             )}
-            <div className="ml-auto flex gap-2">
+            <div className="w-full lg:w-auto lg:ml-auto flex flex-wrap gap-2">
               <button onClick={exportXlsx} className="px-4 py-2 bg-slate-900 hover:bg-slate-800 text-white font-semibold rounded">
                 ⬇ Excel
               </button>
